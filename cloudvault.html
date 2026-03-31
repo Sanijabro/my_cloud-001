@@ -1,0 +1,1365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>CloudVault – Secure Cloud Storage</title>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     🔑  CONFIGURATION  –  Replace these values before deploying
+     ═══════════════════════════════════════════════════════════════
+     1. Google:  https://console.cloud.google.com/
+        • Create an OAuth 2.0 Client ID (Web application)
+        • Enable Google Drive API
+        • Add your domain to Authorized JS origins
+        • Add your redirect URI
+     2. GitHub:  https://github.com/settings/applications/new
+        • Register a new OAuth App
+        • Set Authorization callback URL to your redirect URI
+        • GitHub token exchange needs a small backend proxy
+          (see comments below for a Cloudflare Worker / Netlify Function)
+     ════════════════════════════════════════════════════════════ -->
+<script>
+  const CONFIG = {
+    GOOGLE_CLIENT_ID:  "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com",
+    GOOGLE_API_KEY:    "YOUR_GOOGLE_DRIVE_API_KEY",
+    GITHUB_CLIENT_ID:  "YOUR_GITHUB_CLIENT_ID",
+    // Point this to your backend endpoint that exchanges GitHub code → token
+    // e.g. "https://your-worker.workers.dev/github-token"
+    GITHUB_TOKEN_PROXY: "YOUR_GITHUB_TOKEN_PROXY_URL",
+    SCOPES: "https://www.googleapis.com/auth/drive",
+  };
+</script>
+
+<!-- Google Identity Services & Drive API -->
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script src="https://apis.google.com/js/api.js" async defer></script>
+
+<style>
+/* ─── Design tokens ─────────────────────────────────────── */
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,300&family=Space+Mono:wght@400;700&display=swap');
+
+:root {
+  --bg:         #0a0c10;
+  --bg1:        #111318;
+  --bg2:        #181c23;
+  --bg3:        #1e232c;
+  --border:     #252a35;
+  --border2:    #2e3542;
+  --text:       #e8ecf4;
+  --text2:      #8b93a8;
+  --text3:      #5a6278;
+  --accent:     #4f8ef7;
+  --accent2:    #38d9c0;
+  --google:     #ea4335;
+  --github:     #f0f6fc;
+  --danger:     #f05252;
+  --success:    #22c55e;
+  --radius:     12px;
+  --radius-sm:  8px;
+  --shadow:     0 4px 24px rgba(0,0,0,0.5);
+  --font:       'DM Sans', sans-serif;
+  --mono:       'Space Mono', monospace;
+  --transition: 0.18s cubic-bezier(0.4,0,0.2,1);
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.5;
+  overflow-x: hidden;
+}
+
+/* ─── Scrollbar ─────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg1); }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 99px; }
+
+/* ─── Utility ────────────────────────────────────────────── */
+.hidden { display: none !important; }
+.flex { display: flex; }
+.items-center { align-items: center; }
+.gap-2 { gap: 8px; }
+.gap-3 { gap: 12px; }
+.gap-4 { gap: 16px; }
+.ml-auto { margin-left: auto; }
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ─── Loading overlay ────────────────────────────────────── */
+#loading-overlay {
+  position: fixed; inset: 0;
+  background: var(--bg);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  z-index: 1000;
+  gap: 20px;
+  transition: opacity 0.4s ease;
+}
+#loading-overlay .logo-mark {
+  width: 56px; height: 56px;
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  border-radius: 16px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 26px;
+  animation: pulse 1.6s ease-in-out infinite;
+}
+@keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.7;transform:scale(.95)} }
+#loading-overlay p { color: var(--text2); font-size: 14px; letter-spacing: .04em; }
+
+/* ─── Login page ─────────────────────────────────────────── */
+#login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background:
+    radial-gradient(ellipse 80% 60% at 50% -20%, rgba(79,142,247,.12) 0%, transparent 70%),
+    radial-gradient(ellipse 60% 40% at 80% 110%, rgba(56,217,192,.08) 0%, transparent 60%),
+    var(--bg);
+}
+
+.login-card {
+  width: 100%;
+  max-width: 420px;
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 48px 40px 40px;
+  box-shadow: var(--shadow);
+  animation: slideUp .5s cubic-bezier(.16,1,.3,1) both;
+}
+@keyframes slideUp { from{opacity:0;transform:translateY(24px)} to{opacity:1;transform:translateY(0)} }
+
+.login-logo {
+  display: flex; align-items: center; gap: 12px;
+  margin-bottom: 36px;
+}
+.login-logo .mark {
+  width: 44px; height: 44px;
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  border-radius: 12px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 20px;
+}
+.login-logo .name {
+  font-size: 22px; font-weight: 600; letter-spacing: -.02em;
+}
+.login-logo .name span { color: var(--accent); }
+
+.login-headline {
+  font-size: 26px; font-weight: 600; letter-spacing: -.03em;
+  line-height: 1.2; margin-bottom: 8px;
+}
+.login-sub {
+  color: var(--text2); font-size: 14px; margin-bottom: 32px;
+}
+
+.auth-btn {
+  width: 100%;
+  display: flex; align-items: center; justify-content: center; gap: 12px;
+  padding: 13px 20px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font);
+  font-size: 14px; font-weight: 500;
+  cursor: pointer;
+  border: 1px solid var(--border2);
+  background: var(--bg2);
+  color: var(--text);
+  transition: var(--transition);
+  position: relative;
+  overflow: hidden;
+}
+.auth-btn::after {
+  content: '';
+  position: absolute; inset: 0;
+  background: white;
+  opacity: 0;
+  transition: opacity .15s;
+}
+.auth-btn:hover::after { opacity: .04; }
+.auth-btn:active::after { opacity: .08; }
+.auth-btn + .auth-btn { margin-top: 12px; }
+
+.auth-btn svg { flex-shrink: 0; }
+
+.divider {
+  display: flex; align-items: center; gap: 12px;
+  margin: 24px 0;
+  color: var(--text3); font-size: 12px; letter-spacing: .06em; text-transform: uppercase;
+}
+.divider::before, .divider::after {
+  content: ''; flex: 1; height: 1px; background: var(--border);
+}
+
+.login-footer {
+  margin-top: 28px; text-align: center;
+  font-size: 12px; color: var(--text3);
+}
+.login-footer a { color: var(--accent); text-decoration: none; }
+
+/* ─── App shell ──────────────────────────────────────────── */
+#app { display: none; flex-direction: column; height: 100vh; }
+
+/* Top bar */
+.topbar {
+  height: 58px;
+  background: var(--bg1);
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; padding: 0 20px; gap: 12px;
+  flex-shrink: 0;
+  position: sticky; top: 0; z-index: 50;
+}
+.topbar .logo {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 17px; font-weight: 600; letter-spacing: -.02em;
+  text-decoration: none; color: var(--text);
+  margin-right: 12px;
+}
+.topbar .logo .mark {
+  width: 32px; height: 32px;
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 16px;
+}
+.topbar .logo span { color: var(--accent); }
+
+.search-bar {
+  flex: 1; max-width: 480px;
+  display: flex; align-items: center; gap: 10px;
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0 14px; height: 36px;
+}
+.search-bar input {
+  background: none; border: none; outline: none;
+  color: var(--text); font-family: var(--font); font-size: 14px;
+  flex: 1; min-width: 0;
+}
+.search-bar input::placeholder { color: var(--text3); }
+.search-bar svg { color: var(--text3); flex-shrink: 0; }
+
+.topbar-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+
+.btn {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 7px 14px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font); font-size: 13px; font-weight: 500;
+  cursor: pointer; border: none;
+  transition: var(--transition);
+}
+.btn-primary {
+  background: var(--accent); color: #fff;
+}
+.btn-primary:hover { background: #6fa3fa; }
+.btn-ghost {
+  background: transparent; color: var(--text2);
+  border: 1px solid var(--border);
+}
+.btn-ghost:hover { background: var(--bg2); color: var(--text); }
+.btn-danger {
+  background: rgba(240,82,82,.15); color: var(--danger);
+  border: 1px solid rgba(240,82,82,.25);
+}
+.btn-danger:hover { background: rgba(240,82,82,.25); }
+
+/* User avatar */
+.avatar {
+  width: 34px; height: 34px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px; font-weight: 600;
+  cursor: pointer; overflow: hidden; flex-shrink: 0;
+}
+.avatar img { width: 100%; height: 100%; object-fit: cover; }
+
+/* Dropdown */
+.dropdown { position: relative; }
+.dropdown-menu {
+  position: absolute; top: calc(100% + 8px); right: 0;
+  background: var(--bg2); border: 1px solid var(--border2);
+  border-radius: var(--radius); min-width: 200px;
+  box-shadow: var(--shadow); z-index: 200;
+  padding: 6px;
+  animation: fadeIn .15s ease;
+}
+@keyframes fadeIn { from{opacity:0;transform:translateY(-6px)} to{opacity:1;transform:translateY(0)} }
+.dropdown-menu.hidden { display: none; }
+.dropdown-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 12px; border-radius: 6px;
+  font-size: 13px; color: var(--text2);
+  cursor: pointer; transition: var(--transition);
+}
+.dropdown-item:hover { background: var(--bg3); color: var(--text); }
+.dropdown-item.danger { color: var(--danger); }
+.dropdown-item.danger:hover { background: rgba(240,82,82,.12); }
+.dropdown-divider { height: 1px; background: var(--border); margin: 6px 0; }
+.dropdown-user { padding: 10px 12px 14px; }
+.dropdown-user .name { font-size: 14px; font-weight: 500; color: var(--text); }
+.dropdown-user .email { font-size: 12px; color: var(--text3); margin-top: 2px; }
+
+/* ─── Main layout ────────────────────────────────────────── */
+.main { display: flex; flex: 1; overflow: hidden; }
+
+/* Sidebar */
+.sidebar {
+  width: 220px; flex-shrink: 0;
+  background: var(--bg1);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  padding: 16px 10px; gap: 2px;
+  overflow-y: auto;
+}
+.sidebar-label {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .1em;
+  color: var(--text3); font-weight: 600;
+  padding: 6px 10px 4px; margin-top: 10px;
+}
+.sidebar-label:first-child { margin-top: 0; }
+.nav-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 12px; border-radius: var(--radius-sm);
+  font-size: 13.5px; color: var(--text2);
+  cursor: pointer; transition: var(--transition);
+  user-select: none;
+}
+.nav-item:hover { background: var(--bg2); color: var(--text); }
+.nav-item.active {
+  background: rgba(79,142,247,.15);
+  color: var(--accent);
+}
+.nav-item svg { flex-shrink: 0; opacity: .8; }
+.nav-item .badge {
+  margin-left: auto; background: var(--bg3); color: var(--text3);
+  font-size: 11px; padding: 1px 7px; border-radius: 99px;
+}
+
+/* Storage bar */
+.storage-panel {
+  margin-top: auto; padding: 16px 10px 6px;
+  border-top: 1px solid var(--border);
+}
+.storage-panel .label { font-size: 12px; color: var(--text2); margin-bottom: 8px; }
+.storage-bar { height: 4px; background: var(--bg3); border-radius: 99px; overflow: hidden; }
+.storage-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); border-radius: 99px; }
+.storage-nums { display: flex; justify-content: space-between; margin-top: 6px; font-size: 11px; color: var(--text3); }
+
+/* Content area */
+.content { flex: 1; overflow-y: auto; padding: 24px 28px; }
+
+/* Breadcrumb */
+.breadcrumb {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; color: var(--text3); margin-bottom: 20px;
+}
+.breadcrumb span { cursor: pointer; transition: color .15s; }
+.breadcrumb span:hover { color: var(--accent); }
+.breadcrumb .sep { color: var(--border2); }
+.breadcrumb .current { color: var(--text); font-weight: 500; }
+
+/* Toolbar */
+.toolbar {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 20px;
+}
+.view-toggle {
+  display: flex; background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+}
+.view-btn {
+  padding: 6px 10px; cursor: pointer;
+  color: var(--text3); transition: var(--transition);
+  background: none; border: none; display: flex; align-items: center;
+}
+.view-btn.active { background: var(--bg3); color: var(--text); }
+
+/* Sort / filter */
+.sort-select {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 7px 10px;
+  font-family: var(--font); font-size: 13px; color: var(--text2);
+  cursor: pointer; outline: none;
+}
+
+/* Stats bar */
+.stats-bar {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px;
+  margin-bottom: 28px;
+}
+.stat-card {
+  background: var(--bg1); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 16px 18px;
+}
+.stat-card .s-label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--text3); font-weight: 600; margin-bottom: 6px; }
+.stat-card .s-value { font-size: 22px; font-weight: 600; letter-spacing: -.03em; }
+.stat-card .s-sub { font-size: 12px; color: var(--text3); margin-top: 3px; }
+
+/* File grid */
+.file-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 14px;
+}
+.file-list { display: flex; flex-direction: column; gap: 2px; }
+
+/* File card – grid */
+.file-card {
+  background: var(--bg1); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 16px;
+  cursor: pointer; transition: var(--transition);
+  position: relative; overflow: hidden;
+}
+.file-card:hover {
+  border-color: var(--border2);
+  background: var(--bg2);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0,0,0,.35);
+}
+.file-card .file-icon {
+  width: 44px; height: 44px;
+  border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 22px;
+  margin-bottom: 12px;
+}
+.file-card .file-name { font-size: 13px; font-weight: 500; margin-bottom: 4px; }
+.file-card .file-meta { font-size: 11px; color: var(--text3); }
+.file-card .file-actions {
+  position: absolute; top: 8px; right: 8px;
+  display: flex; gap: 4px; opacity: 0; transition: opacity .15s;
+}
+.file-card:hover .file-actions { opacity: 1; }
+.file-action-btn {
+  width: 28px; height: 28px;
+  background: var(--bg3); border: 1px solid var(--border2);
+  border-radius: 6px; display: flex; align-items: center; justify-content: center;
+  cursor: pointer; transition: var(--transition); color: var(--text2);
+}
+.file-action-btn:hover { color: var(--text); border-color: var(--accent); }
+.file-action-btn.del:hover { color: var(--danger); border-color: var(--danger); background: rgba(240,82,82,.1); }
+
+/* File row – list view */
+.file-row {
+  display: flex; align-items: center; gap: 14px;
+  padding: 10px 14px;
+  background: var(--bg1); border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer; transition: var(--transition);
+}
+.file-row:hover { background: var(--bg2); border-color: var(--border); }
+.file-row .row-icon { width: 34px; height: 34px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; }
+.file-row .row-name { font-size: 13.5px; flex: 1; min-width: 0; }
+.file-row .row-size { font-size: 12px; color: var(--text3); width: 80px; text-align: right; flex-shrink: 0; }
+.file-row .row-date { font-size: 12px; color: var(--text3); width: 120px; text-align: right; flex-shrink: 0; }
+.file-row .row-actions { display: flex; gap: 4px; opacity: 0; transition: opacity .15s; }
+.file-row:hover .row-actions { opacity: 1; }
+
+/* Empty state */
+.empty-state {
+  text-align: center; padding: 64px 24px;
+}
+.empty-state .empty-icon { font-size: 56px; margin-bottom: 20px; opacity: .4; }
+.empty-state h3 { font-size: 18px; font-weight: 500; color: var(--text2); margin-bottom: 8px; }
+.empty-state p { font-size: 14px; color: var(--text3); max-width: 320px; margin: 0 auto 24px; }
+
+/* Upload drop zone */
+.drop-zone {
+  border: 2px dashed var(--border2);
+  border-radius: var(--radius);
+  padding: 32px;
+  text-align: center;
+  color: var(--text3); font-size: 14px;
+  margin-bottom: 24px;
+  transition: var(--transition);
+  cursor: pointer;
+}
+.drop-zone:hover, .drop-zone.dragging {
+  border-color: var(--accent);
+  background: rgba(79,142,247,.06);
+  color: var(--accent);
+}
+.drop-zone .drop-icon { font-size: 32px; margin-bottom: 10px; }
+
+/* Modal */
+.modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.65);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 500; padding: 24px;
+  animation: fadeOverlay .2s ease;
+}
+@keyframes fadeOverlay { from{opacity:0} to{opacity:1} }
+.modal {
+  background: var(--bg1); border: 1px solid var(--border2);
+  border-radius: 16px; width: 100%; max-width: 440px;
+  padding: 28px; box-shadow: var(--shadow);
+  animation: modalIn .25s cubic-bezier(.16,1,.3,1);
+}
+@keyframes modalIn { from{opacity:0;transform:scale(.95)} to{opacity:1;transform:scale(1)} }
+.modal h3 { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
+.modal p { font-size: 14px; color: var(--text2); margin-bottom: 24px; }
+.modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+.modal input {
+  width: 100%; background: var(--bg2); border: 1px solid var(--border2);
+  border-radius: var(--radius-sm); padding: 10px 14px;
+  font-family: var(--font); font-size: 14px; color: var(--text);
+  outline: none; margin-bottom: 20px; transition: border-color .15s;
+}
+.modal input:focus { border-color: var(--accent); }
+
+/* Toast */
+#toast-container {
+  position: fixed; bottom: 24px; right: 24px;
+  display: flex; flex-direction: column; gap: 8px; z-index: 1000;
+}
+.toast {
+  display: flex; align-items: center; gap: 12px;
+  background: var(--bg2); border: 1px solid var(--border2);
+  border-radius: var(--radius-sm); padding: 12px 16px;
+  font-size: 13px; min-width: 260px;
+  box-shadow: var(--shadow);
+  animation: toastIn .3s cubic-bezier(.16,1,.3,1);
+}
+@keyframes toastIn { from{opacity:0;transform:translateX(24px)} to{opacity:1;transform:translateX(0)} }
+.toast.success { border-left: 3px solid var(--success); }
+.toast.error   { border-left: 3px solid var(--danger); }
+.toast.info    { border-left: 3px solid var(--accent); }
+.toast .t-icon { font-size: 18px; flex-shrink: 0; }
+
+/* Progress bar */
+.progress-bar {
+  width: 100%; height: 3px;
+  background: var(--bg3); border-radius: 99px; overflow: hidden;
+  margin-top: 8px;
+}
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  border-radius: 99px; width: 0;
+  transition: width .3s ease;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .sidebar { width: 56px; padding: 12px 8px; }
+  .sidebar-label, .nav-item .nav-label, .storage-panel { display: none; }
+  .nav-item { justify-content: center; padding: 10px; }
+  .stats-bar { grid-template-columns: 1fr; }
+  .file-grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+  .content { padding: 16px; }
+}
+</style>
+</head>
+<body>
+
+<!-- Loading overlay -->
+<div id="loading-overlay">
+  <div class="logo-mark">☁️</div>
+  <p>Starting CloudVault…</p>
+</div>
+
+<!-- ═══════════════════════════════ LOGIN PAGE ═══════════════════════════════ -->
+<div id="login-page" class="hidden">
+  <div class="login-card">
+    <div class="login-logo">
+      <div class="mark">☁️</div>
+      <div class="name">Cloud<span>Vault</span></div>
+    </div>
+    <h1 class="login-headline">Your files, everywhere.</h1>
+    <p class="login-sub">Sign in to access your secure cloud storage powered by Google Drive.</p>
+
+    <button class="auth-btn" id="btn-google-login">
+      <svg width="18" height="18" viewBox="0 0 18 18"><path fill="#EA4335" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908c1.702-1.567 2.684-3.875 2.684-6.615z"/><path fill="#4285F4" d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 0 0 9 18z"/><path fill="#FBBC05" d="M3.964 10.71A5.41 5.41 0 0 1 3.682 9c0-.593.102-1.17.282-1.71V4.958H.957A8.996 8.996 0 0 0 0 9c0 1.452.348 2.827.957 4.042l3.007-2.332z"/><path fill="#34A853" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.958L3.964 7.29C4.672 5.163 6.656 3.58 9 3.58z"/></svg>
+      Continue with Google
+    </button>
+
+    <div class="divider">or</div>
+
+    <button class="auth-btn" id="btn-github-login">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+      Continue with GitHub
+    </button>
+
+    <div class="login-footer">
+      By signing in you agree to our
+      <a href="#">Terms</a> &amp; <a href="#">Privacy Policy</a>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════ APP ════════════════════════════════════ -->
+<div id="app">
+  <!-- Top bar -->
+  <header class="topbar">
+    <a href="#" class="logo">
+      <div class="mark">☁️</div>
+      Cloud<span>Vault</span>
+    </a>
+
+    <div class="search-bar">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+      <input type="text" id="search-input" placeholder="Search files and folders…" />
+    </div>
+
+    <div class="topbar-actions">
+      <button class="btn btn-primary" id="btn-upload-top">
+        <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        Upload
+      </button>
+      <div class="dropdown">
+        <div class="avatar" id="user-avatar" onclick="toggleDropdown()">U</div>
+        <div class="dropdown-menu hidden" id="user-dropdown">
+          <div class="dropdown-user">
+            <div class="name" id="dd-name">User</div>
+            <div class="email" id="dd-email">user@example.com</div>
+          </div>
+          <div class="dropdown-divider"></div>
+          <div class="dropdown-item" onclick="createFolder()">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+            New Folder
+          </div>
+          <div class="dropdown-item" onclick="refreshFiles()">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-.18-5.71"/></svg>
+            Refresh
+          </div>
+          <div class="dropdown-divider"></div>
+          <div class="dropdown-item danger" onclick="signOut()">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+            Sign Out
+          </div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <div class="main">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="nav-item active" onclick="navigateTo('root')" id="nav-my-drive">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        <span class="nav-label">My Drive</span>
+      </div>
+      <div class="nav-item" onclick="showRecent()" id="nav-recent">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        <span class="nav-label">Recent</span>
+      </div>
+      <div class="nav-item" onclick="showStarred()" id="nav-starred">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+        <span class="nav-label">Starred</span>
+      </div>
+      <div class="nav-item" onclick="showTrash()" id="nav-trash">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+        <span class="nav-label">Trash</span>
+      </div>
+
+      <div class="storage-panel">
+        <div class="label">Storage</div>
+        <div class="storage-bar"><div class="storage-bar-fill" id="storage-fill" style="width:0%"></div></div>
+        <div class="storage-nums">
+          <span id="storage-used">– GB used</span>
+          <span id="storage-total">15 GB</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Content -->
+    <main class="content" id="main-content">
+      <!-- Stats -->
+      <div class="stats-bar" id="stats-bar">
+        <div class="stat-card">
+          <div class="s-label">Total Files</div>
+          <div class="s-value" id="stat-files">–</div>
+          <div class="s-sub">in My Drive</div>
+        </div>
+        <div class="stat-card">
+          <div class="s-label">Storage Used</div>
+          <div class="s-value" id="stat-storage">–</div>
+          <div class="s-sub">of 15 GB</div>
+        </div>
+        <div class="stat-card">
+          <div class="s-label">Last Modified</div>
+          <div class="s-value" id="stat-last">–</div>
+          <div class="s-sub">most recent file</div>
+        </div>
+      </div>
+
+      <!-- Breadcrumb -->
+      <div class="breadcrumb" id="breadcrumb">
+        <span onclick="navigateTo('root')">My Drive</span>
+      </div>
+
+      <!-- Toolbar -->
+      <div class="toolbar">
+        <button class="btn btn-primary" id="btn-upload-main" onclick="triggerUpload()">
+          <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          Upload File
+        </button>
+        <button class="btn btn-ghost" onclick="createFolder()">
+          <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+          New Folder
+        </button>
+        <div class="ml-auto flex gap-2 items-center">
+          <select class="sort-select" id="sort-select" onchange="sortFiles()">
+            <option value="name">Name</option>
+            <option value="modifiedTime">Modified</option>
+            <option value="size">Size</option>
+          </select>
+          <div class="view-toggle">
+            <button class="view-btn active" id="btn-grid" onclick="setView('grid')">
+              <svg width="14" height="14" fill="currentColor" viewBox="0 0 16 16"><path d="M1 2.5A1.5 1.5 0 0 1 2.5 1h3A1.5 1.5 0 0 1 7 2.5v3A1.5 1.5 0 0 1 5.5 7h-3A1.5 1.5 0 0 1 1 5.5v-3zm8 0A1.5 1.5 0 0 1 10.5 1h3A1.5 1.5 0 0 1 15 2.5v3A1.5 1.5 0 0 1 13.5 7h-3A1.5 1.5 0 0 1 9 5.5v-3zm-8 8A1.5 1.5 0 0 1 2.5 9h3A1.5 1.5 0 0 1 7 10.5v3A1.5 1.5 0 0 1 5.5 15h-3A1.5 1.5 0 0 1 1 13.5v-3zm8 0A1.5 1.5 0 0 1 10.5 9h3A1.5 1.5 0 0 1 15 10.5v3A1.5 1.5 0 0 1 13.5 15h-3A1.5 1.5 0 0 1 9 13.5v-3z"/></svg>
+            </button>
+            <button class="view-btn" id="btn-list" onclick="setView('list')">
+              <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Drop zone -->
+      <div class="drop-zone" id="drop-zone" onclick="triggerUpload()">
+        <div class="drop-icon">📁</div>
+        <div>Drop files here or <strong>click to upload</strong></div>
+        <input type="file" id="file-input" multiple style="display:none" onchange="handleFileSelect(this.files)">
+      </div>
+
+      <!-- Files container -->
+      <div id="files-container" class="file-grid"></div>
+    </main>
+  </div>
+</div>
+
+<!-- ─── Modals ────────────────────────────────────────────── -->
+<div id="modal-overlay" class="modal-overlay hidden" onclick="closeModal(event)">
+  <div class="modal" id="modal-box">
+    <h3 id="modal-title">New Folder</h3>
+    <p id="modal-desc">Enter a name for the new folder.</p>
+    <input type="text" id="modal-input" placeholder="Folder name…" />
+    <div class="progress-bar hidden" id="modal-progress">
+      <div class="progress-fill" id="modal-progress-fill"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="modal-confirm">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- ─── Toast container ───────────────────────────────────── -->
+<div id="toast-container"></div>
+
+<!-- ══════════════════════════════ JAVASCRIPT ═══════════════════════════════ -->
+<script>
+/* ──────────────────────────── State ──────────────────────────────────────── */
+let currentUser   = null;
+let accessToken   = null;
+let authProvider  = null;  // 'google' | 'github'
+let currentFolder = 'root';
+let folderStack   = [];    // [{id, name}]
+let allFiles      = [];
+let currentView   = 'grid';
+let tokenClient   = null;
+
+/* ──────────────────────────── Init ───────────────────────────────────────── */
+window.addEventListener('load', () => {
+  // Check for GitHub OAuth callback
+  const params = new URLSearchParams(window.location.search);
+  const ghCode = params.get('code');
+  if (ghCode) {
+    history.replaceState({}, '', window.location.pathname);
+    exchangeGitHubCode(ghCode);
+    return;
+  }
+
+  // Try restore saved session
+  const saved = sessionStorage.getItem('cv_token');
+  const savedUser = sessionStorage.getItem('cv_user');
+  if (saved && savedUser) {
+    accessToken = saved;
+    currentUser = JSON.parse(savedUser);
+    authProvider = sessionStorage.getItem('cv_provider') || 'google';
+    hideLoading();
+    showApp();
+    loadFiles();
+    return;
+  }
+
+  // Wait for Google GSI to load
+  const gsiInterval = setInterval(() => {
+    if (typeof google !== 'undefined' && google.accounts) {
+      clearInterval(gsiInterval);
+      initGoogleAuth();
+    }
+  }, 200);
+
+  setTimeout(() => { clearInterval(gsiInterval); hideLoading(); showLogin(); }, 5000);
+});
+
+function hideLoading() {
+  const el = document.getElementById('loading-overlay');
+  el.style.opacity = '0';
+  setTimeout(() => el.classList.add('hidden'), 400);
+}
+
+/* ──────────────────────────── Google Auth ────────────────────────────────── */
+function initGoogleAuth() {
+  if (!CONFIG.GOOGLE_CLIENT_ID.startsWith('YOUR')) {
+    tokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: CONFIG.GOOGLE_CLIENT_ID,
+      scope: CONFIG.SCOPES,
+      callback: onGoogleToken,
+    });
+  }
+  hideLoading();
+  showLogin();
+}
+
+document.getElementById('btn-google-login').addEventListener('click', () => {
+  if (CONFIG.GOOGLE_CLIENT_ID.startsWith('YOUR')) {
+    showToast('⚙️ Set your GOOGLE_CLIENT_ID in the CONFIG block at the top of this file.', 'info', 6000);
+    return;
+  }
+  if (tokenClient) tokenClient.requestAccessToken();
+});
+
+async function onGoogleToken(response) {
+  if (response.error) { showToast('Google sign-in failed: ' + response.error, 'error'); return; }
+  accessToken = response.access_token;
+  authProvider = 'google';
+
+  // Fetch user profile
+  try {
+    const res = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    });
+    currentUser = await res.json();
+    sessionStorage.setItem('cv_token', accessToken);
+    sessionStorage.setItem('cv_user', JSON.stringify(currentUser));
+    sessionStorage.setItem('cv_provider', 'google');
+    showApp();
+    loadFiles();
+  } catch(e) {
+    showToast('Failed to fetch profile.', 'error');
+  }
+}
+
+/* ──────────────────────────── GitHub Auth ────────────────────────────────── */
+document.getElementById('btn-github-login').addEventListener('click', () => {
+  if (CONFIG.GITHUB_CLIENT_ID.startsWith('YOUR')) {
+    showToast('⚙️ Set your GITHUB_CLIENT_ID in the CONFIG block at the top of this file.', 'info', 6000);
+    return;
+  }
+  const redirectUri = encodeURIComponent(window.location.href.split('?')[0]);
+  const scope = encodeURIComponent('read:user user:email');
+  window.location.href =
+    `https://github.com/login/oauth/authorize?client_id=${CONFIG.GITHUB_CLIENT_ID}&redirect_uri=${redirectUri}&scope=${scope}`;
+});
+
+async function exchangeGitHubCode(code) {
+  if (CONFIG.GITHUB_TOKEN_PROXY.startsWith('YOUR')) {
+    hideLoading(); showLogin();
+    showToast('⚙️ GitHub OAuth requires a token proxy backend. See comments in CONFIG.', 'info', 8000);
+    return;
+  }
+  try {
+    showToast('Authenticating with GitHub…', 'info');
+    const res = await fetch(CONFIG.GITHUB_TOKEN_PROXY, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code })
+    });
+    const { access_token } = await res.json();
+    if (!access_token) throw new Error('No token');
+
+    const profileRes = await fetch('https://api.github.com/user', {
+      headers: { Authorization: `Bearer ${access_token}`, Accept: 'application/vnd.github.v3+json' }
+    });
+    const ghUser = await profileRes.json();
+
+    // GitHub login uses its own storage via token
+    // For Drive integration, you'd normally link accounts – here we mock it
+    currentUser = {
+      name: ghUser.name || ghUser.login,
+      email: ghUser.email || `${ghUser.login}@github.com`,
+      picture: ghUser.avatar_url,
+      id: String(ghUser.id),
+    };
+    authProvider = 'github';
+    // NOTE: GitHub token cannot access Google Drive.
+    // For Drive access after GitHub login, use a linked Google account or a backend.
+    sessionStorage.setItem('cv_user', JSON.stringify(currentUser));
+    sessionStorage.setItem('cv_provider', 'github');
+    hideLoading();
+    showApp();
+    showToast('✅ Signed in with GitHub! Connect Google Drive in settings for full access.', 'info', 7000);
+    renderEmptyState('Connect Google Drive', 'GitHub login is set up! To access Google Drive files, link your Google account or use Google sign-in.', '🔗');
+  } catch(e) {
+    hideLoading(); showLogin();
+    showToast('GitHub auth failed: ' + e.message, 'error');
+  }
+}
+
+/* ──────────────────────────── UI helpers ─────────────────────────────────── */
+function showLogin() {
+  document.getElementById('login-page').classList.remove('hidden');
+  document.getElementById('app').style.display = 'none';
+}
+
+function showApp() {
+  document.getElementById('login-page').classList.add('hidden');
+  document.getElementById('app').style.display = 'flex';
+  // Populate user info
+  const u = currentUser;
+  if (u) {
+    document.getElementById('dd-name').textContent  = u.name || 'User';
+    document.getElementById('dd-email').textContent = u.email || '';
+    const avatar = document.getElementById('user-avatar');
+    if (u.picture) {
+      avatar.innerHTML = `<img src="${u.picture}" alt="avatar">`;
+    } else {
+      avatar.textContent = (u.name || 'U')[0].toUpperCase();
+    }
+  }
+}
+
+function signOut() {
+  sessionStorage.clear();
+  if (authProvider === 'google' && typeof google !== 'undefined') {
+    google.accounts.oauth2.revoke(accessToken, () => {});
+  }
+  accessToken = null; currentUser = null; authProvider = null;
+  allFiles = [];
+  showLogin();
+  showToast('Signed out.', 'info');
+}
+
+function toggleDropdown() {
+  document.getElementById('user-dropdown').classList.toggle('hidden');
+}
+document.addEventListener('click', e => {
+  if (!e.target.closest('.dropdown')) {
+    document.getElementById('user-dropdown').classList.add('hidden');
+  }
+});
+
+/* ──────────────────────────── Google Drive API ───────────────────────────── */
+async function driveAPI(path, opts = {}) {
+  const base = 'https://www.googleapis.com/drive/v3';
+  const res = await fetch(base + path, {
+    ...opts,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      ...(opts.headers || {})
+    }
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `API error ${res.status}`);
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+async function loadFiles(folderId = 'root') {
+  if (!accessToken) { renderEmptyState(); return; }
+  currentFolder = folderId;
+  document.getElementById('files-container').innerHTML =
+    '<div style="color:var(--text3);padding:40px;text-align:center">Loading…</div>';
+  try {
+    const q = `'${folderId}' in parents and trashed=false`;
+    const fields = 'files(id,name,mimeType,size,modifiedTime,thumbnailLink,starred)';
+    const sort = document.getElementById('sort-select').value;
+    const data = await driveAPI(
+      `/files?q=${encodeURIComponent(q)}&fields=${fields}&orderBy=${sort}&pageSize=100`
+    );
+    allFiles = data.files || [];
+    renderFiles(allFiles);
+    updateStats();
+    loadStorageQuota();
+  } catch(e) {
+    showToast('Error loading files: ' + e.message, 'error');
+    renderEmptyState('Could not load files', e.message);
+  }
+}
+
+async function loadStorageQuota() {
+  if (!accessToken) return;
+  try {
+    const data = await driveAPI('/about?fields=storageQuota');
+    const { usage, limit } = data.storageQuota;
+    const usedGB  = (parseInt(usage) / 1e9).toFixed(2);
+    const totalGB = limit ? (parseInt(limit) / 1e9).toFixed(0) : '15';
+    const pct = limit ? Math.min((parseInt(usage) / parseInt(limit)) * 100, 100) : 0;
+    document.getElementById('storage-fill').style.width = pct + '%';
+    document.getElementById('storage-used').textContent = usedGB + ' GB used';
+    document.getElementById('storage-total').textContent = totalGB + ' GB';
+    document.getElementById('stat-storage').textContent = usedGB + ' GB';
+  } catch(_) {}
+}
+
+function updateStats() {
+  document.getElementById('stat-files').textContent = allFiles.length;
+  if (allFiles.length > 0) {
+    const latest = allFiles.slice().sort((a,b) => new Date(b.modifiedTime) - new Date(a.modifiedTime))[0];
+    const d = new Date(latest.modifiedTime);
+    document.getElementById('stat-last').textContent = d.toLocaleDateString('en', {month:'short', day:'numeric'});
+  }
+}
+
+/* ──────────────────────────── Render ─────────────────────────────────────── */
+function renderFiles(files) {
+  const el = document.getElementById('files-container');
+  if (!files.length) { renderEmptyState(); return; }
+  const filtered = document.getElementById('search-input').value
+    ? files.filter(f => f.name.toLowerCase().includes(document.getElementById('search-input').value.toLowerCase()))
+    : files;
+  if (!filtered.length) { el.innerHTML = '<div style="color:var(--text3);padding:32px;text-align:center">No files match your search.</div>'; return; }
+
+  el.className = currentView === 'grid' ? 'file-grid' : 'file-list';
+  el.innerHTML = filtered.map(f => currentView === 'grid' ? renderCard(f) : renderRow(f)).join('');
+}
+
+function fileIcon(mime) {
+  if (!mime) return { emoji:'📄', bg:'rgba(139,147,168,.15)' };
+  if (mime === 'application/vnd.google-apps.folder') return { emoji:'📁', bg:'rgba(79,142,247,.15)' };
+  if (mime.startsWith('image/'))  return { emoji:'🖼️', bg:'rgba(56,217,192,.15)' };
+  if (mime.startsWith('video/'))  return { emoji:'🎬', bg:'rgba(245,101,101,.15)' };
+  if (mime.startsWith('audio/'))  return { emoji:'🎵', bg:'rgba(168,85,247,.15)' };
+  if (mime.includes('pdf'))       return { emoji:'📕', bg:'rgba(245,101,101,.15)' };
+  if (mime.includes('spreadsheet') || mime.includes('excel')) return { emoji:'📊', bg:'rgba(34,197,94,.15)' };
+  if (mime.includes('presentation') || mime.includes('powerpoint')) return { emoji:'📑', bg:'rgba(249,115,22,.15)' };
+  if (mime.includes('document') || mime.includes('word')) return { emoji:'📝', bg:'rgba(79,142,247,.15)' };
+  if (mime.includes('zip') || mime.includes('tar')) return { emoji:'📦', bg:'rgba(234,179,8,.15)' };
+  return { emoji:'📄', bg:'rgba(139,147,168,.15)' };
+}
+
+function fmtSize(bytes) {
+  if (!bytes) return '–';
+  const n = parseInt(bytes);
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n/1024).toFixed(1) + ' KB';
+  if (n < 1073741824) return (n/1048576).toFixed(1) + ' MB';
+  return (n/1073741824).toFixed(2) + ' GB';
+}
+function fmtDate(iso) {
+  if (!iso) return '–';
+  return new Date(iso).toLocaleDateString('en', {month:'short', day:'numeric', year:'numeric'});
+}
+
+function renderCard(f) {
+  const {emoji, bg} = fileIcon(f.mimeType);
+  const isFolder = f.mimeType === 'application/vnd.google-apps.folder';
+  return `<div class="file-card" onclick="handleFileClick('${f.id}','${f.mimeType}',event)">
+    <div class="file-actions">
+      ${!isFolder ? `<div class="file-action-btn" title="Download" onclick="downloadFile('${f.id}','${f.name}',event)">
+        <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      </div>` : ''}
+      <div class="file-action-btn del" title="Delete" onclick="deleteFile('${f.id}','${f.name}',event)">
+        <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+      </div>
+    </div>
+    <div class="file-icon" style="background:${bg}">${emoji}</div>
+    <div class="file-name truncate">${f.name}</div>
+    <div class="file-meta">${fmtSize(f.size)} · ${fmtDate(f.modifiedTime)}</div>
+  </div>`;
+}
+
+function renderRow(f) {
+  const {emoji, bg} = fileIcon(f.mimeType);
+  const isFolder = f.mimeType === 'application/vnd.google-apps.folder';
+  return `<div class="file-row" onclick="handleFileClick('${f.id}','${f.mimeType}',event)">
+    <div class="row-icon" style="background:${bg}">${emoji}</div>
+    <div class="row-name truncate">${f.name}</div>
+    <div class="row-size">${fmtSize(f.size)}</div>
+    <div class="row-date">${fmtDate(f.modifiedTime)}</div>
+    <div class="row-actions">
+      ${!isFolder ? `<div class="file-action-btn" title="Download" onclick="downloadFile('${f.id}','${f.name}',event)">
+        <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      </div>` : ''}
+      <div class="file-action-btn del" title="Delete" onclick="deleteFile('${f.id}','${f.name}',event)">
+        <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderEmptyState(title='No files yet', desc='Upload a file or create a folder to get started.', icon='📂') {
+  document.getElementById('files-container').innerHTML = `
+    <div class="empty-state" style="grid-column:1/-1">
+      <div class="empty-icon">${icon}</div>
+      <h3>${title}</h3>
+      <p>${desc}</p>
+      <button class="btn btn-primary" onclick="triggerUpload()">
+        <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        Upload File
+      </button>
+    </div>`;
+}
+
+/* ──────────────────────────── File actions ───────────────────────────────── */
+function handleFileClick(id, mime, e) {
+  if (e.target.closest('.file-action-btn')) return;
+  if (mime === 'application/vnd.google-apps.folder') {
+    navigateTo(id);
+  } else {
+    openFile(id, mime);
+  }
+}
+
+async function openFile(id, mime) {
+  // Open native Google formats in Docs/Sheets/Slides
+  if (mime.startsWith('application/vnd.google-apps.')) {
+    window.open(`https://drive.google.com/file/d/${id}/view`, '_blank');
+    return;
+  }
+  // Stream a preview
+  window.open(`https://drive.google.com/file/d/${id}/preview`, '_blank');
+}
+
+async function downloadFile(id, name, e) {
+  e.stopPropagation();
+  showToast('⬇️ Downloading ' + name, 'info');
+  try {
+    const res = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${id}?alt=media`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name; a.click();
+    URL.revokeObjectURL(url);
+    showToast('✅ Download complete!', 'success');
+  } catch(err) {
+    showToast('Download failed: ' + err.message, 'error');
+  }
+}
+
+async function deleteFile(id, name, e) {
+  e.stopPropagation();
+  if (!confirm(`Move "${name}" to trash?`)) return;
+  try {
+    await driveAPI(`/files/${id}`, { method: 'DELETE' });
+    allFiles = allFiles.filter(f => f.id !== id);
+    renderFiles(allFiles);
+    document.getElementById('stat-files').textContent = allFiles.length;
+    showToast('🗑️ Moved to trash.', 'success');
+  } catch(err) {
+    showToast('Delete failed: ' + err.message, 'error');
+  }
+}
+
+/* ──────────────────────────── Upload ────────────────────────────────────── */
+function triggerUpload() {
+  document.getElementById('file-input').click();
+}
+document.getElementById('btn-upload-top').addEventListener('click', triggerUpload);
+
+async function handleFileSelect(files) {
+  for (const file of files) await uploadFile(file);
+}
+
+async function uploadFile(file) {
+  showToast(`⬆️ Uploading ${file.name}…`, 'info');
+  try {
+    // Multipart upload
+    const metadata = {
+      name: file.name,
+      parents: [currentFolder === 'root' ? 'root' : currentFolder]
+    };
+    const form = new FormData();
+    form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+    form.append('file', file);
+    const res = await fetch(
+      'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,size,modifiedTime',
+      { method: 'POST', headers: { Authorization: `Bearer ${accessToken}` }, body: form }
+    );
+    if (!res.ok) throw new Error('Upload failed');
+    const f = await res.json();
+    allFiles.unshift(f);
+    renderFiles(allFiles);
+    updateStats();
+    showToast(`✅ ${file.name} uploaded!`, 'success');
+  } catch(err) {
+    showToast('Upload failed: ' + err.message, 'error');
+  }
+}
+
+// Drag and drop
+const dz = document.getElementById('drop-zone');
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dragging'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('dragging'));
+dz.addEventListener('drop', e => {
+  e.preventDefault(); dz.classList.remove('dragging');
+  handleFileSelect(e.dataTransfer.files);
+});
+
+/* ──────────────────────────── Folder navigation ─────────────────────────── */
+function navigateTo(folderId, folderName) {
+  if (folderId === 'root') {
+    folderStack = [];
+    document.getElementById('breadcrumb').innerHTML =
+      '<span class="current">My Drive</span>';
+  } else {
+    folderStack.push({ id: folderId, name: folderName || 'Folder' });
+    rebuildBreadcrumb();
+  }
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById('nav-my-drive').classList.add('active');
+  loadFiles(folderId);
+}
+
+function rebuildBreadcrumb() {
+  const bc = document.getElementById('breadcrumb');
+  let html = '<span onclick="navigateTo(\'root\')">My Drive</span>';
+  folderStack.forEach((f, i) => {
+    html += '<span class="sep">›</span>';
+    if (i === folderStack.length - 1) {
+      html += `<span class="current">${f.name}</span>`;
+    } else {
+      html += `<span onclick="navigateTo('${f.id}','${f.name}')">${f.name}</span>`;
+    }
+  });
+  bc.innerHTML = html;
+}
+
+/* ──────────────────────────── Create folder ─────────────────────────────── */
+function createFolder() {
+  openModal({
+    title: 'New Folder', desc: 'Enter a name for the new folder.',
+    placeholder: 'Folder name…', confirm: 'Create',
+    onConfirm: async (name) => {
+      try {
+        const f = await driveAPI('/files?fields=id,name,mimeType,modifiedTime', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name, mimeType: 'application/vnd.google-apps.folder',
+            parents: [currentFolder]
+          })
+        });
+        allFiles.unshift(f);
+        renderFiles(allFiles);
+        showToast('📁 Folder created!', 'success');
+      } catch(err) {
+        showToast('Error: ' + err.message, 'error');
+      }
+    }
+  });
+}
+
+/* ──────────────────────────── Views ─────────────────────────────────────── */
+function setView(v) {
+  currentView = v;
+  document.getElementById('btn-grid').classList.toggle('active', v === 'grid');
+  document.getElementById('btn-list').classList.toggle('active', v === 'list');
+  renderFiles(allFiles);
+}
+
+function sortFiles() { loadFiles(currentFolder); }
+function refreshFiles() { loadFiles(currentFolder); showToast('🔄 Refreshed', 'info'); }
+
+/* ──────────────────────────── Sidebar nav ────────────────────────────────── */
+async function showRecent() {
+  setNavActive('nav-recent');
+  document.getElementById('files-container').innerHTML =
+    '<div style="color:var(--text3);padding:40px;text-align:center">Loading…</div>';
+  try {
+    const data = await driveAPI(
+      '/files?orderBy=viewedByMeTime desc&pageSize=30&fields=files(id,name,mimeType,size,modifiedTime)'
+    );
+    allFiles = data.files || [];
+    document.getElementById('breadcrumb').innerHTML = '<span class="current">Recent</span>';
+    renderFiles(allFiles);
+  } catch(e) { showToast('Error: ' + e.message, 'error'); }
+}
+
+async function showStarred() {
+  setNavActive('nav-starred');
+  try {
+    const data = await driveAPI(
+      '/files?q=starred%3Dtrue and trashed%3Dfalse&fields=files(id,name,mimeType,size,modifiedTime)'
+    );
+    allFiles = data.files || [];
+    document.getElementById('breadcrumb').innerHTML = '<span class="current">Starred</span>';
+    renderFiles(allFiles);
+  } catch(e) { showToast('Error: ' + e.message, 'error'); }
+}
+
+async function showTrash() {
+  setNavActive('nav-trash');
+  try {
+    const data = await driveAPI(
+      '/files?q=trashed%3Dtrue&fields=files(id,name,mimeType,size,modifiedTime)'
+    );
+    allFiles = data.files || [];
+    document.getElementById('breadcrumb').innerHTML = '<span class="current">Trash</span>';
+    renderFiles(allFiles);
+  } catch(e) { showToast('Error: ' + e.message, 'error'); }
+}
+
+function setNavActive(id) {
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  folderStack = [];
+}
+
+/* ──────────────────────────── Search ────────────────────────────────────── */
+let searchTimeout;
+document.getElementById('search-input').addEventListener('input', e => {
+  clearTimeout(searchTimeout);
+  searchTimeout = setTimeout(async () => {
+    const q = e.target.value.trim();
+    if (!q) { loadFiles(currentFolder); return; }
+    if (!accessToken) return;
+    try {
+      const data = await driveAPI(
+        `/files?q=name contains '${q.replace(/'/g, "\\'")}' and trashed=false&fields=files(id,name,mimeType,size,modifiedTime)&pageSize=50`
+      );
+      allFiles = data.files || [];
+      renderFiles(allFiles);
+    } catch(err) { showToast('Search error: ' + err.message, 'error'); }
+  }, 400);
+});
+
+/* ──────────────────────────── Modal ─────────────────────────────────────── */
+let modalCallback = null;
+function openModal({ title, desc, placeholder, confirm, onConfirm }) {
+  document.getElementById('modal-title').textContent = title;
+  document.getElementById('modal-desc').textContent = desc;
+  document.getElementById('modal-input').placeholder = placeholder;
+  document.getElementById('modal-input').value = '';
+  document.getElementById('modal-confirm').textContent = confirm;
+  document.getElementById('modal-overlay').classList.remove('hidden');
+  document.getElementById('modal-input').focus();
+  modalCallback = onConfirm;
+  document.getElementById('modal-confirm').onclick = async () => {
+    const val = document.getElementById('modal-input').value.trim();
+    if (!val) return;
+    closeModal();
+    if (modalCallback) await modalCallback(val);
+  };
+}
+function closeModal(e) {
+  if (e && e.target !== document.getElementById('modal-overlay')) return;
+  document.getElementById('modal-overlay').classList.add('hidden');
+}
+document.getElementById('modal-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('modal-confirm').click();
+  if (e.key === 'Escape') closeModal();
+});
+
+/* ──────────────────────────── Toast ─────────────────────────────────────── */
+function showToast(msg, type = 'info', duration = 3500) {
+  const icons = { success: '✅', error: '❌', info: 'ℹ️' };
+  const t = document.createElement('div');
+  t.className = `toast ${type}`;
+  t.innerHTML = `<span class="t-icon">${icons[type]}</span><span>${msg}</span>`;
+  document.getElementById('toast-container').appendChild(t);
+  setTimeout(() => { t.style.opacity = '0'; t.style.transform = 'translateX(24px)'; t.style.transition = '.3s'; setTimeout(() => t.remove(), 300); }, duration);
+}
+</script>
+</body>
+</html>
